@@ -54,8 +54,13 @@
 #define EXPOSURE_P_GAIN 100.0f
 #define EXPOSURE_I_GAIN 0.5f
 #define EXPOSURE_D_GAIN 0.5f
+#define GAIN_P_GAIN 50.0f
+#define GAIN_I_GAIN 0.5f
+#define GAIN_D_GAIN 0.5f
 #define EXPOSURE_CHANGE_THRESHOLD 30.0
 #define EXPOSURE_ABOSULUTE_MAX_VALUE 1727
+#define GAIN_CHANGE_THRESHOLD 15.0
+#define GAIN_ABOSULUTE_MAX_VALUE 100 //TODO check
 #define CAMERA_FPS_MIN 70
 
 using namespace cv;
@@ -194,6 +199,10 @@ void Mainloop::_exposure_update(Mat frame, uint64_t timestamp_us)
 	if (timestamp_us < _next_exposure_update_timestap) {
 		return;
 	}
+  static cv::VideoWriter outputVideo("/home/root/exposure_test_new.avi",CV_FOURCC('M','J','P','G'),5, Size(128,128));
+  cv::Mat colorFrame;
+  cv::cvtColor(frame, colorFrame, CV_GRAY2BGR);
+  outputVideo.write(colorFrame);
 
 	cv::Mat mask(frame.rows, frame.cols, CV_8U,cv::Scalar(0));
 	mask(cv::Rect(frame.cols / 2 - EXPOSURE_MASK_SIZE / 2,
@@ -216,27 +225,56 @@ void Mainloop::_exposure_update(Mat frame, uint64_t timestamp_us)
 
 	/* PID-controller */
 	float msv_error = EXPOSURE_MSV_TARGET - msv;
-	float msv_error_d = msv_error - _exposure_msv_error_old;
-	_exposure_msv_error_int += msv_error;
+	float msv_error_d = msv_error - _msv_error_old;
+	_msv_error_int += msv_error;
 
 	float exposure = _camera->exposure_get();
-	exposure += (EXPOSURE_P_GAIN * msv_error) + (EXPOSURE_I_GAIN * _exposure_msv_error_int) + (EXPOSURE_D_GAIN * msv_error_d);
+  float gain = _camera->gain_get();
 
-	if (exposure > EXPOSURE_ABOSULUTE_MAX_VALUE) {
-		exposure = EXPOSURE_ABOSULUTE_MAX_VALUE;
-	} else if (exposure < 1) {
-		exposure = 1;
-	}
+  exposure += (EXPOSURE_P_GAIN * msv_error) + (EXPOSURE_I_GAIN * _msv_error_int) + (EXPOSURE_D_GAIN * msv_error_d);
 
-	_exposure_msv_error_old = msv_error;
+	// adjust the gain if exposure is saturated
+	if (gain > 1.0f || (exposure > EXPOSURE_ABOSULUTE_MAX_VALUE-1 && _camera->exposure_get() > EXPOSURE_ABOSULUTE_MAX_VALUE-1)) {
+		//calculate new gain value based on MSV
+		gain += (GAIN_P_GAIN*msv_error) + (GAIN_I_GAIN*_msv_error_int) + (GAIN_D_GAIN*msv_error_d);
 
-	/* set new exposure value if bigger than threshold */
-	if (fabs(exposure - _camera->exposure_get()) > EXPOSURE_CHANGE_THRESHOLD) {
+		if (gain > GAIN_ABOSULUTE_MAX_VALUE) {
+			gain = GAIN_ABOSULUTE_MAX_VALUE;
+		} else if (gain < 1.0f) {
+			gain = 1.0f;
+		}
+
+		/* set new gain value if bigger than threshold */
+		if (fabs(gain - _camera->gain_get()) > GAIN_CHANGE_THRESHOLD || (gain < 2.0f && _camera->gain_get() > 1.0f) ||
+		    (gain > GAIN_ABOSULUTE_MAX_VALUE-1 && _camera->gain_get() < GAIN_ABOSULUTE_MAX_VALUE)) {
+      printf("gain set %u\n", (uint16_t)gain);
 #if DEBUG_LEVEL
-		DEBUG("exposure set %u", (uint16_t)exposure);
+			DEBUG("gain set %u", (uint16_t)gain);
 #endif
-		_camera->exposure_set(exposure);
+			_camera->gain_set(gain);
+		}
+
+	} else { // adjust exposure
+
+		if (exposure > EXPOSURE_ABOSULUTE_MAX_VALUE) {
+			exposure = EXPOSURE_ABOSULUTE_MAX_VALUE;
+		} else if (exposure < 1.0f) {
+			exposure = 1.0f;
+		}
+
+		/* set new exposure value if bigger than threshold */
+		if (fabs(exposure - _camera->exposure_get()) > EXPOSURE_CHANGE_THRESHOLD || (exposure < 2.0f && _camera->exposure_get() > 1.0f) ||
+		    (exposure > EXPOSURE_ABOSULUTE_MAX_VALUE-1 && _camera->exposure_get() < EXPOSURE_ABOSULUTE_MAX_VALUE)) {
+      printf("exposure set %u\n", (uint16_t)exposure);
+#if DEBUG_LEVEL
+			DEBUG("exposure set %u", (uint16_t)exposure);
+#endif
+			_camera->exposure_set(exposure);
+		}
+
 	}
+
+	_msv_error_old = msv_error;
 
 	/* update exposure at 5Hz */
 	_next_exposure_update_timestap = timestamp_us + (USEC_PER_SEC / 5);
@@ -286,6 +324,11 @@ void Mainloop::camera_callback(const void *img, UNUSED size_t len, const struct 
 	// Copy the data into new matrix -> cropped_image.data can not be used in calcFlow()...
 	cropped_image.copyTo(cropped);
 	cropped_image.release();
+
+  // static cv::VideoWriter outputVideo("/home/root/exposure_test_new2.avi",CV_FOURCC('M','J','P','G'),5, Size(128,128));
+  // cv::Mat colorFrame;
+  // cv::cvtColor(cropped, colorFrame, CV_GRAY2BGR);
+  // outputVideo.write(colorFrame);
 
 	int flow_quality = _optical_flow->calcFlow(cropped.data, (uint32_t)img_time_us, dt_us, flow_x_ang, flow_y_ang);
 
@@ -344,6 +387,18 @@ void Mainloop::camera_callback(const void *img, UNUSED size_t len, const struct 
 
 static void _highres_imu_msg_callback(const mavlink_highres_imu_t *msg, void *data)
 {
+	static bool hz_init = false;
+	uint32_t time_us = msg->time_usec;
+	static uint32_t time_us_prev = 0;
+	double hz = 0;
+
+	if (hz_init) {
+		hz = 1.0 / ((double)(time_us - time_us_prev) / USEC_PER_SEC);
+	} else {
+		hz_init = true;
+	}
+	// DEBUG("mavlink imu cb, hz = %f time_dt = %ld  %d", hz, (time_us-time_us_prev), USEC_PER_SEC);
+	time_us_prev = time_us;
 	Mainloop *mainloop = (Mainloop *)data;
 	mainloop->highres_imu_msg_callback(msg);
 }
